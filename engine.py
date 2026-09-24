@@ -16,6 +16,7 @@ open trade is skipped (walk's `pos` cooldown).
 """
 
 import time
+import json
 
 import config
 import strategy
@@ -56,6 +57,9 @@ class TokenState:
         except Exception as e:
             self.db.event("error", self.addr, payload={"msg": str(e)})
             return False
+        # drop the in-progress candle: its close/high/low are provisional until
+        # the minute closes, and a backtest only ever sees closed bars.
+        bars = [b for b in bars if b[0] + 60000 <= time.time() * 1000]
         self.ingest(bars)
         return True
 
@@ -63,6 +67,20 @@ class TokenState:
     def _ref_for(self, lb):
         highs = [b[2] for b in self.bars]
         return strategy.ref_for(highs, lb)
+
+    def _peak_is_stale(self, i, lb, peak):
+        """True if the bar that set the rolling-high peak (within the lb window)
+        is older than FRESH_DIP_BARS. Peak confirm = last bar whose high == peak.
+        0 or disabled      -> never stale (keeps exact walk() behavior)."""
+        limit = config.FRESH_DIP_BARS
+        if not limit:
+            return False
+        hi = [b[2] for b in self.bars]
+        lo = max(0, i - lb)
+        for j in range(i - 1, lo - 1, -1):   # scan back from signal bar
+            if hi[j] == peak:
+                return (i - j) > limit
+        return True  # peak not found in window: treat as stale (defensive)
 
     def _my_exit(self, cfg, open_trade_idx, entry_price, ref_peak):
         """Causal scan for one open trade on the CURRENT series, matching
@@ -130,7 +148,7 @@ class TokenState:
         row = self.db.candidate(addr)
         if row and row[8] == "PAPER_TRADE":
             open_remaining = self.db.open_trades(addr)
-            self.db.set_candidate_state(addr, "EXITED" if not open_remaining else row[7])
+            self.db.set_candidate_state(addr, "EXITED" if not open_remaining else "PAPER_TRADE")
 
     def _entry_signal(self, cfg, decision_ts, decision_ms, i=None):
         n = len(self.bars)
@@ -170,6 +188,34 @@ class TokenState:
             self.db.row_eval(self.addr, cfg, market_ts, decision_ts, decision_ms,
                              close_i, ref_i, drawdown, False, "no-signal")
             return
+        if self._peak_is_stale(i, cfg["lb"], ref_i):
+            # Vapor-only cohort guard (deviates from walk()): dip signal fires but
+            # the reference peak formed long ago -> post-apex bleeder, skip.
+            self.db.row_eval(self.addr, cfg, market_ts, decision_ts, decision_ms,
+                             close_i, ref_i, drawdown, False, "stale-peak")
+            return
+        min_pcp1h = config.MIN_PCP1H_PCT
+        if min_pcp1h:
+            # metadata gate (Vapor-only): skip tokens bleeding over the last hour.
+            cand = self.db.candidate(self.addr)
+            if cand:
+                meta = json.loads(cand[9] or "{}")
+                pcp1h = meta.get("pcp1h")
+                if not isinstance(pcp1h, (int, float)) or pcp1h < min_pcp1h:
+                    self.db.row_eval(self.addr, cfg, market_ts, decision_ts, decision_ms,
+                                     close_i, ref_i, drawdown, False, "cold-pcp1h")
+                    return
+        min_mc = config.MIN_META_MC
+        if min_mc:
+            # metadata gate (Vapor-only): skip micro-caps; they bleed past the SL.
+            cand = self.db.candidate(self.addr)
+            if cand:
+                meta = json.loads(cand[9] or "{}")
+                mc = meta.get("mc")
+                if not isinstance(mc, (int, float)) or mc < min_mc:
+                    self.db.row_eval(self.addr, cfg, market_ts, decision_ts, decision_ms,
+                                     close_i, ref_i, drawdown, False, "small-cap")
+                    return
         self.db.row_eval(self.addr, cfg, market_ts, decision_ts, decision_ms,
                          close_i, ref_i, drawdown, True, "signal")
         self.db.event("setup_detected", self.addr, cfg["id"], {

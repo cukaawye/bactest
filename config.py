@@ -22,6 +22,20 @@ MAX_LB = max(c["lb"] for c in FROZEN_CONFIGS)
 # live paper trades sit in the same population. min_periods=1 still applies above it,
 # matching common.ref_for exactly (partial rolling window for lb > bars-1).
 MIN_BARS_ENTER = 122
+# ponytail: fresh-dip gate (Vapor-only, deviates from walk()): the entry signal's
+# reference peak must have formed within this many bars of the signal bar, else the
+# token peaked long ago and is a post-apex bleeder (live trending surfaces these and
+# they lose ~100% of trades). 0 disables. Peaks older than this -> reason "stale-peak".
+FRESH_DIP_BARS = 30
+# ponytail: metadata gate (Vapor-only): min 1-hour % price change of the token at
+# discovery (metadata snapshot). Live winners had pcp1h +19..+54, losers -19..-94
+# (buy strength, not weakness). 0 disables; pcp1h < this -> reason "cold-pcp1h".
+MIN_PCP1H_PCT = 0
+# ponytail: metadata gate (Vapor-only): min market cap at discovery. Live data
+# segregated hard on market cap: mc<50k net -22.2 / WR 14%, mc>=300k net +6.8 /
+# WR 79% (same factor as holders + liquidity — big, established tokens survive the
+# dip; micro-caps keep bleeding). 0 disables; mc < this -> reason "small-cap".
+MIN_META_MC = 0
 
 # ---- exit mechanics (common.py) ----
 REC = 0.05  # recovery-exit level as fraction of entry reference peak

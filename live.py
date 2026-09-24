@@ -65,9 +65,7 @@ def main():
     states = rebuild_state(db, None, gm)
     print("Vapor live |", status_line(db), "| restored", len(states), "token states")
 
-    if not states:
-        states = refresh_universe(db, gm, states)
-        db.commit()
+    next_discovery = 0.0  # always refresh once at boot, then every DISCOVERY_SECONDS
 
     try:
         while True:
@@ -93,11 +91,11 @@ def main():
                         st.mark("MONITORING")
             db.commit()
 
-            # 2. periodic universe refresh
-            elapsed = time.time() - t0
-            if elapsed >= config.DISCOVERY_SECONDS or elapsed <= 0:
+            # 2. periodic universe refresh on wall-clock cadence
+            if time.time() >= next_discovery:
                 states = refresh_universe(db, gm, states)
                 db.commit()
+                next_discovery = time.time() + config.DISCOVERY_SECONDS
 
             print("vapor |", status_line(db))
             db.commit()

@@ -442,6 +442,133 @@ def test_pre_watch_and_warmup_bars_never_trigger_entries():
 
 
 @test
+def test_refresh_history_drops_in_progress_bar():
+    # GMGN returns the current in-progress minute with a provisional close; the
+    # engine must never evaluate it (a backtest only sees closed bars).
+    db = dbmod.DB(temp_db())
+    addr = "hotbar"
+    db.upsert_candidate(addr, "HOT", "HOT", 1.0, 10000.0, {})
+    base = int(time.time() * 1000) // 60000 * 60000
+    closed = [bar(base - (5 - k) * 60000, 1.0, 1.0, 1.0, 1.0) for k in range(5)]
+    inprog = bar(base, 1.0, 1.0, 0.4, 0.4)  # would-be signal candle, still forming
+
+    class FakeGMGN:
+        def klines(self, addr, begin, end):
+            return closed + [inprog]
+
+    st = engine.TokenState(addr, db, FakeGMGN(), watch_start_ms=base)
+    assert st.refresh_history()
+    assert len(st.bars) == 5 and st.bars[-1][0] < base, "in-progress bar ingested"
+
+
+@test
+def test_fresh_dip_gate_blocks_stale_peaks():
+    # Vapor-only cohort guard (deviation from walk()): a dip signal whose ref peak
+    # formed > FRESH_DIP_BARS ago is a post-apex bleeder -> skip (reason stale-peak).
+    base = int(time.time() * 1000)
+    cfg = {"id": 960, "lb": 120, "dip": 0.25, "tp": 0.5, "sl": 0.5, "hold": 0}
+
+    def run(peak_bar_idx):
+        db = dbmod.DB(temp_db())
+        addr = "freshtest"
+        db.upsert_candidate(addr, "FD", "FD", 1.0, 10000.0, {})
+        s = [bar(base + k * 60000, 1.0, 1.0, 1.0, 1.0) for k in range(122)]
+        hi = s[peak_bar_idx]
+        s[peak_bar_idx] = bar(hi[0], hi[1], 2.0, hi[3], hi[4])  # peak 2.0 here
+        sig = bar(base + 122 * 60000, 1.0, 1.0, 0.6, 0.6)       # close 0.6 < 0.75*2.0
+        st = engine.TokenState(addr, db, None, watch_start_ms=s[-1][0] + 1000)
+        st.configs = [cfg]
+        st.ingest(s + [sig])
+        st.process_new_bars(time.time())
+        reasons = [r[0] for r in db.conn.execute("SELECT DISTINCT reason FROM evaluations")]
+        return st.open_trade_ids, reasons
+
+    # peak 60 bars before signal bar -> stale (62 > 30) -> no trade
+    open_t, reasons_stale = run(peak_bar_idx=60)
+    assert len(open_t) == 0, open_t
+    assert "stale-peak" in reasons_stale, reasons_stale
+    # peak on the bar right before the signal -> fresh (1 <= 30) -> trade opens
+    open_t, reasons_fresh = run(peak_bar_idx=121)
+    assert len(open_t) == 1, open_t
+    assert "stale-peak" not in reasons_fresh, reasons_fresh
+
+
+@test
+def test_metadata_gate_blocks_cold_tokens():
+    # Vapor-only gate: pcp1h (1h price change) below MIN_PCP1H_PCT -> skip (cold-pcp1h)
+    base = int(time.time() * 1000)
+    cfg = {"id": 960, "lb": 10, "dip": 0.25, "tp": 0.5, "sl": 0.5, "hold": 0}
+    s = mk_series(config.MIN_BARS_ENTER, 1.0)                    # 122 flat bars
+    sig = bar(base + 122 * 60000, 1.0, 1.0, 0.6, 0.6)            # dip bar 0.6 < 0.75*1.0
+    prev = config.MIN_PCP1H_PCT
+    try:
+        config.MIN_PCP1H_PCT = 0          # gate off -> fresh dip fires (peak is recent)
+        db = dbmod.DB(temp_db())
+        db.upsert_candidate("coldtest", "CD", "CD", 1.0, 10000.0, {"pcp1h": -50.0})
+        st = engine.TokenState("coldtest", db, None, watch_start_ms=s[-1][0] + 1000)
+        st.configs = [cfg]
+        st.ingest(s + [sig]); st.process_new_bars(time.time())
+        assert len(st.open_trade_ids) == 1, st.open_trade_ids
+        # gate on (>= 10) -> same setup, cold meta (-50) -> skipped
+        config.MIN_PCP1H_PCT = 10
+        db = dbmod.DB(temp_db())
+        db.upsert_candidate("coldtest", "CD", "CD", 1.0, 10000.0, {"pcp1h": -50.0})
+        st = engine.TokenState("coldtest", db, None, watch_start_ms=s[-1][0] + 1000)
+        st.configs = [cfg]
+        st.ingest(s + [sig]); st.process_new_bars(time.time())
+        assert len(st.open_trade_ids) == 0, st.open_trade_ids
+        reasons = [r[0] for r in db.conn.execute("SELECT DISTINCT reason FROM evaluations")]
+        assert "cold-pcp1h" in reasons, reasons
+        # warm meta (+50) passes the gate -> trade fires
+        config.MIN_PCP1H_PCT = 10
+        db = dbmod.DB(temp_db())
+        db.upsert_candidate("coldtest", "CD", "CD", 1.0, 10000.0, {"pcp1h": 50.0})
+        st = engine.TokenState("coldtest", db, None, watch_start_ms=s[-1][0] + 1000)
+        st.configs = [cfg]
+        st.ingest(s + [sig]); st.process_new_bars(time.time())
+        assert len(st.open_trade_ids) == 1, st.open_trade_ids
+    finally:
+        config.MIN_PCP1H_PCT = prev
+
+
+@test
+def test_metadata_gate_blocks_small_caps():
+    # Vapor-only gate: mc below MIN_META_MC -> skip (small-cap)
+    base = int(time.time() * 1000)
+    mk = lambda mc: ({"mc": mc}, {"mc": mc})
+    s = mk_series(config.MIN_BARS_ENTER, 1.0)
+    sig = bar(base + 122 * 60000, 1.0, 1.0, 0.6, 0.6)
+    cfg = {"id": 960, "lb": 10, "dip": 0.25, "tp": 0.5, "sl": 0.5, "hold": 0}
+    prev = config.MIN_META_MC
+    try:
+        config.MIN_META_MC = 0
+        db = dbmod.DB(temp_db())
+        db.upsert_candidate("mctest", "MC", "MC", 1.0, 10000.0, {"mc": 50000.0})
+        st = engine.TokenState("mctest", db, None, watch_start_ms=s[-1][0] + 1000)
+        st.configs = [cfg]
+        st.ingest(s + [sig]); st.process_new_bars(time.time())
+        assert len(st.open_trade_ids) == 1, st.open_trade_ids
+        config.MIN_META_MC = 300000
+        db = dbmod.DB(temp_db())
+        db.upsert_candidate("mctest", "MC", "MC", 1.0, 10000.0, {"mc": 50000.0})
+        st = engine.TokenState("mctest", db, None, watch_start_ms=s[-1][0] + 1000)
+        st.configs = [cfg]
+        st.ingest(s + [sig]); st.process_new_bars(time.time())
+        assert len(st.open_trade_ids) == 0, st.open_trade_ids
+        reasons = [r[0] for r in db.conn.execute("SELECT DISTINCT reason FROM evaluations")]
+        assert "small-cap" in reasons, reasons
+        config.MIN_META_MC = 300000
+        db = dbmod.DB(temp_db())
+        db.upsert_candidate("mctest", "MC", "MC", 1.0, 10000.0, {"mc": 900000.0})
+        st = engine.TokenState("mctest", db, None, watch_start_ms=s[-1][0] + 1000)
+        st.configs = [cfg]
+        st.ingest(s + [sig]); st.process_new_bars(time.time())
+        assert len(st.open_trade_ids) == 1, st.open_trade_ids
+    finally:
+        config.MIN_META_MC = prev
+
+
+@test
 def test_parity_with_research_walk():
     import numpy as np
     rl = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "really_learn")
