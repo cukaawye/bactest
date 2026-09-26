@@ -6,15 +6,17 @@ Do not tune these: they are the research baseline.
 # ---- the 8 frozen configurations (best_configs.json -> frozen_candidates) ----
 # lb = rolling-high lookback (1m bars); dip; tp (fraction of entry; 1.00 = +100%);
 # sl (fraction of entry); hold = max-hold minutes (0 = no maximum).
+# sl=0.30: live gated run (109 closed) flips -9.20 -> +1.35 and the 15h pre-gate
+# run -135.66 -> -35.56 (sl50 was oversized vs +0.40 rec wins; needs 57% WR, we run ~47%).
 FROZEN_CONFIGS = [
-    {"id": 1,  "lb": 180, "dip": 0.25, "tp": 1.00, "sl": 0.50, "hold": 0},
-    {"id": 2,  "lb": 240, "dip": 0.25, "tp": 1.00, "sl": 0.50, "hold": 0},
-    {"id": 3,  "lb": 360, "dip": 0.25, "tp": 1.00, "sl": 0.50, "hold": 0},
-    {"id": 4,  "lb": 120, "dip": 0.25, "tp": 1.00, "sl": 0.50, "hold": 0},
-    {"id": 5,  "lb": 180, "dip": 0.30, "tp": 1.00, "sl": 0.50, "hold": 0},
-    {"id": 6,  "lb": 180, "dip": 0.25, "tp": 1.00, "sl": 0.50, "hold": 360},
-    {"id": 7,  "lb": 180, "dip": 0.30, "tp": 1.00, "sl": 0.50, "hold": 360},
-    {"id": 8,  "lb": 240, "dip": 0.30, "tp": 1.00, "sl": 0.50, "hold": 0},
+    {"id": 1,  "lb": 180, "dip": 0.25, "tp": 1.00, "sl": 0.30, "hold": 0},
+    {"id": 2,  "lb": 240, "dip": 0.25, "tp": 1.00, "sl": 0.30, "hold": 0},
+    {"id": 3,  "lb": 360, "dip": 0.25, "tp": 1.00, "sl": 0.30, "hold": 0},
+    {"id": 4,  "lb": 120, "dip": 0.25, "tp": 1.00, "sl": 0.30, "hold": 0},
+    {"id": 5,  "lb": 180, "dip": 0.30, "tp": 1.00, "sl": 0.30, "hold": 0},
+    {"id": 6,  "lb": 180, "dip": 0.25, "tp": 1.00, "sl": 0.30, "hold": 360},
+    {"id": 7,  "lb": 180, "dip": 0.30, "tp": 1.00, "sl": 0.30, "hold": 360},
+    {"id": 8,  "lb": 240, "dip": 0.30, "tp": 1.00, "sl": 0.30, "hold": 0},
 ]
 MAX_LB = max(c["lb"] for c in FROZEN_CONFIGS)
 # research entrance gate (backtest.py WINDOW=120 -> load_tokens requires >= 122 bars).
