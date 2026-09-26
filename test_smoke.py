@@ -624,6 +624,8 @@ def temp_db():
 def main():
     os.environ["VAPOR_DB"] = temp_db()
     import pandas as pd, numpy as np  # noqa: F401 (parity needs them importable)
+    gates = (config.MIN_PCP1H_PCT, config.MIN_META_MC)
+    config.MIN_PCP1H_PCT, config.MIN_META_MC = 0, 0
     failures = 0
     for fn in T:
         try:
@@ -635,6 +637,7 @@ def main():
             print(f"  FAIL {fn.__name__}: {e}")
             traceback.print_exc()
     print(f"\n{len(T) - failures}/{len(T)} smoke checks passed")
+    config.MIN_PCP1H_PCT, config.MIN_META_MC = gates
     sys.exit(1 if failures else 0)
 
 
