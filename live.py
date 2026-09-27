@@ -78,6 +78,10 @@ def main():
                 try:
                     new = st.refresh_history()
                     db.add_observations(addr, bars_since(st))
+                    # append-only record of exactly what GMGN returned this fetch so
+                    # a replay sees the same inputs (bars incl. in-progress + price).
+                    price = st.bars[-1][4] if st.bars else None
+                    db.feed_snapshot(addr, decision_ts * 1000, price, st._last_raw_fetch)
                     if not args.dry_run:
                         st.process_new_bars(decision_ts)
                     else:
@@ -94,6 +98,9 @@ def main():
             # 2. periodic universe refresh on wall-clock cadence
             if time.time() >= next_discovery:
                 states = refresh_universe(db, gm, states)
+                refreshed = refresh_meta(db, gm, states)
+                if refreshed:
+                    print(f"  refreshed metadata for {refreshed} candidates")
                 db.commit()
                 next_discovery = time.time() + config.DISCOVERY_SECONDS
 
@@ -113,6 +120,43 @@ def main():
     finally:
         db.commit()
         db.close()
+
+
+def refresh_meta(db, gm, states):
+    """Repair path for stale metadata: token_info() (multi-addr, batched 6) is the
+    only independent meta source, and it was never called outside tests. Refresh
+    pcp1h/mc ONLY for candidates whose meta lacks the gate keys; already-good
+    candidates are left alone (no pointless requests)."""
+    import json as _json
+    need = []
+    for c in db.get_candidates():
+        if c[8] == "EXPIRED" or c[0] not in states:
+            continue
+        try:
+            meta = _json.loads(c[9] or "{}")
+        except (ValueError, TypeError):
+            meta = {}
+        keys = [k for k in ("pcp1h", "mc") if k not in meta]
+        if keys:
+            need.append((c[0], keys))
+    if not need:
+        return 0
+    try:
+        infos = gm.token_info([addr for addr, _ in need])
+        n = 0
+        for info in infos:
+            if not isinstance(info, dict):
+                continue
+            addr = info.get("address") or info.get("a")
+            fresh = {k: info.get(k) for _, k in [(addr, k) for k in ("pcp1h", "mc")]
+                     if info.get(k) is not None}
+            if addr and fresh:
+                db.set_candidate_meta(addr, fresh)
+                n += 1
+        return n
+    except Exception as e:
+        db.event("error", payload={"msg": f"meta refresh: {e}"})
+        return 0
 
 
 def bars_since(st):

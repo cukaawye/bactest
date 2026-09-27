@@ -35,6 +35,7 @@ class TokenState:
         self.last_exit_idx = {c["id"]: -1 for c in self.configs}
         self.last_eval_idx = -2   # last bar index evaluated (setup detection passthrough)
         self.last_trigger_idx = {c["id"]: None for c in self.configs}
+        self._last_raw_fetch = []   # raw bars from the last gmgn fetch (snapshot)
 
     # ---- data feed ----
     def ingest(self, bars):
@@ -59,8 +60,10 @@ class TokenState:
             return False
         # drop the in-progress candle: its close/high/low are provisional until
         # the minute closes, and a backtest only ever sees closed bars.
+        raw = list(bars)
         bars = [b for b in bars if b[0] + 60000 <= time.time() * 1000]
         self.ingest(bars)
+        self._last_raw_fetch = raw   # for the feed snapshot / replay record
         return True
 
     # ---- strategy ----
@@ -91,6 +94,7 @@ class TokenState:
         - hold=0: scan the whole current series; no timeout (stays OPEN).
         """
         c = [b[4] for b in self.bars]
+        o = [b[1] for b in self.bars]
         h = [b[2] for b in self.bars]
         l = [b[3] for b in self.bars]
         n = len(self.bars)
@@ -102,7 +106,10 @@ class TokenState:
         j = i + 1
         while j < we:
             if l[j] <= sl_lvl:
-                return j, sl_lvl, "sl"
+                # gap-aware fill: if the bar OPENED below the stop, the stop gapped
+                # through and the real fill is at the open (worse than the stop level).
+                px = o[j] if config.GAP_FILL and o[j] < sl_lvl else sl_lvl
+                return j, px, "sl"
             if h[j] >= rec_lvl and rec_lvl <= tp_lvl:
                 return j, rec_lvl, "rec"
             if h[j] >= tp_lvl:
@@ -125,6 +132,9 @@ class TokenState:
         try:
             eidx = ents.index(row[0])
         except ValueError:
+            self.db.event("error", self.addr, cfg["id"], {
+                "msg": "entry bar missing from series; trade orphaned", "trade_id": tid,
+                "entry_ts": row[0], "bars": len(self.bars)})
             return
         ex, px, why = self._my_exit(cfg, eidx, row[1], row[2])
         if ex is not None:
@@ -144,7 +154,7 @@ class TokenState:
         self.db.event("paper_exit", addr, cfg["id"], {
             "config_id": cfg["id"], "exit_ts": self.bars[ex][0], "exit_price": px,
             "reason": why, "gross_ret": gross, "net_ret": net,
-            "observed_at": decision_ts * 1000})
+            "observed_at": decision_ms})
         row = self.db.candidate(addr)
         if row and row[8] == "PAPER_TRADE":
             open_remaining = self.db.open_trades(addr)
@@ -197,25 +207,24 @@ class TokenState:
         min_pcp1h = config.MIN_PCP1H_PCT
         if min_pcp1h:
             # metadata gate (Vapor-only): skip tokens bleeding over the last hour.
+            # Fail closed: a missing candidate row / missing meta blocks the entry.
             cand = self.db.candidate(self.addr)
-            if cand:
-                meta = json.loads(cand[9] or "{}")
-                pcp1h = meta.get("pcp1h")
-                if not isinstance(pcp1h, (int, float)) or pcp1h < min_pcp1h:
-                    self.db.row_eval(self.addr, cfg, market_ts, decision_ts, decision_ms,
-                                     close_i, ref_i, drawdown, False, "cold-pcp1h")
-                    return
+            meta = json.loads(cand[9] or "{}") if cand else {}
+            pcp1h = meta.get("pcp1h")
+            if not cand or not isinstance(pcp1h, (int, float)) or pcp1h < min_pcp1h:
+                self.db.row_eval(self.addr, cfg, market_ts, decision_ts, decision_ms,
+                                 close_i, ref_i, drawdown, False, "cold-pcp1h")
+                return
         min_mc = config.MIN_META_MC
         if min_mc:
             # metadata gate (Vapor-only): skip micro-caps; they bleed past the SL.
             cand = self.db.candidate(self.addr)
-            if cand:
-                meta = json.loads(cand[9] or "{}")
-                mc = meta.get("mc")
-                if not isinstance(mc, (int, float)) or mc < min_mc:
-                    self.db.row_eval(self.addr, cfg, market_ts, decision_ts, decision_ms,
-                                     close_i, ref_i, drawdown, False, "small-cap")
-                    return
+            meta = json.loads(cand[9] or "{}") if cand else {}
+            mc = meta.get("mc")
+            if not cand or not isinstance(mc, (int, float)) or mc < min_mc:
+                self.db.row_eval(self.addr, cfg, market_ts, decision_ts, decision_ms,
+                                 close_i, ref_i, drawdown, False, "small-cap")
+                return
         self.db.row_eval(self.addr, cfg, market_ts, decision_ts, decision_ms,
                          close_i, ref_i, drawdown, True, "signal")
         self.db.event("setup_detected", self.addr, cfg["id"], {
@@ -247,8 +256,10 @@ class TokenState:
     def process_new_bars(self, decision_ts=None):
         """Evaluate newly-ingested bars causally, in market order.
         Order within a bar: resolve exits (open trades) then entries, matching walk."""
-        decision_ts = decision_ts or time.time()
-        decision_ms = decision_ts * 1000
+        # normalize to ms once: decision_ts/decision_ms columns and event payloads
+        # must all be ms epoch (entry_ts/exit_ts/market_ts are ms too).
+        decision_ms = (decision_ts or time.time()) * 1000
+        decision_ts = decision_ms
         lo = self.last_eval_idx + 1
         if lo < 0:
             lo = 0
@@ -269,6 +280,7 @@ class TokenState:
 
     def expire(self):
         # close any open trades at last known price (no market data -> end exit)
+        unclosed = []
         for cfg in self.configs:
             tid = self.open_trade_ids.get(cfg["id"])
             if not tid:
@@ -276,10 +288,19 @@ class TokenState:
             row = self.db.conn.execute(
                 "SELECT entry_price, liquidity FROM paper_trades WHERE id=?", (tid,)).fetchone()
             if not row or not self.bars:
+                unclosed.append(tid)
                 continue
             last = self.bars[-1]
             self._close_paper(tid, cfg, len(self.bars) - 1, last[4], "end",
                               time.time(), time.time() * 1000)
+        if unclosed:
+            # never orphan open trades: keep the candidate alive so a later
+            # refresh can still barrier-close them (no data here to mark them).
+            self.state = "MONITORING"
+            self.db.set_candidate_state(self.addr, "MONITORING")
+            self.db.event("error", self.addr, payload={
+                "msg": "expire deferred: open trades with no data", "trade_ids": unclosed})
+            return
         self.db.set_candidate_state(self.addr, "EXPIRED")
         self.state = "EXPIRED"
         self.db.event("candidate_expired", self.addr, payload={"state": "EXPIRED"})

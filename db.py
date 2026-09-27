@@ -29,11 +29,19 @@ CREATE TABLE IF NOT EXISTS candidates (
 );
 CREATE TABLE IF NOT EXISTS observations (
     token_address TEXT,
-    market_ts REAL,          -- bar close time (ms epoch)
+    market_ts REAL,          -- bar open time (ms epoch)
     observed_at REAL,        -- ms epoch when bar was seen
     open REAL, high REAL, low REAL, close REAL, volume REAL,
     PRIMARY KEY (token_address, market_ts)
 );
+CREATE TABLE IF NOT EXISTS feed_snapshots (
+    token_address TEXT,
+    fetched_at REAL,         -- ms epoch when the kline/metadata snapshot was taken
+    price REAL,              -- last known price at fetch time
+    bars_json TEXT,          -- raw 1m bars as returned by GMGN at fetch time
+    meta_json TEXT           -- candidate meta snapshot at fetch time
+);
+CREATE INDEX IF NOT EXISTS idx_fs_token ON feed_snapshots(token_address, fetched_at);
 CREATE TABLE IF NOT EXISTS evaluations (
     id REAL PRIMARY KEY,
     token_address TEXT, config_id INTEGER,
@@ -111,7 +119,7 @@ class DB:
                ON CONFLICT(token_address) DO UPDATE SET
                  symbol=excluded.symbol, name=excluded.name, last_seen_at=excluded.last_seen_at,
                  current_price=excluded.current_price, liquidity=excluded.liquidity,
-                 meta_json=excluded.meta_json""",
+                 meta_json=excluded.meta_json, misses=0""",
             (addr, symbol, name, first, now, price, liquidity, "DISCOVERED",
              json.dumps(meta or {}), now))
         return first
@@ -133,19 +141,44 @@ class DB:
 
     # ---- observations ----
     def add_observations(self, addr, bars):
-        """bars: list of (market_ts_ms, open, high, low, close, volume)."""
+        """bars: list of (market_ts_ms, open, high, low, close, volume).
+        Revision semantics: a re-fetched bar with the same market_ts overwrites
+        the previous row (GMGN may revise a bar's OHLCV after first emission)."""
         if not bars:
             return
         now = time.time() * 1000
         rows = [(addr, b[0], now, b[1], b[2], b[3], b[4], b[5]) for b in bars]
         self.conn.executemany(
-            "INSERT OR IGNORE INTO observations VALUES(?,?,?,?,?,?,?,?)", rows)
+            """INSERT INTO observations VALUES(?,?,?,?,?,?,?,?)
+               ON CONFLICT(token_address, market_ts) DO UPDATE SET
+                 observed_at=excluded.observed_at, open=excluded.open, high=excluded.high,
+                 low=excluded.low, close=excluded.close, volume=excluded.volume""", rows)
+
+    def feed_snapshot(self, addr, fetched_at_ms, price, bars, meta=None):
+        """Append-only snapshot of exactly what GMGN returned at one fetch, so a
+        later replay has the same inputs the live bot had (bars + metadata)."""
+        self.conn.execute(
+            """INSERT INTO feed_snapshots(token_address,fetched_at,price,bars_json,meta_json)
+               VALUES(?,?,?,?,?)""",
+            (addr, fetched_at_ms, price, json.dumps(bars, default=str),
+             json.dumps(meta or {}, default=str)))
 
     def observations(self, addr):
         cur = self.conn.execute(
             "SELECT market_ts,open,high,low,close,volume FROM observations "
             "WHERE token_address=? ORDER BY market_ts", (addr,))
         return [tuple(r) for r in cur.fetchall()]
+
+    def set_candidate_meta(self, addr, meta):
+        """Merge a fresh meta snapshot into the candidate row (repair path for
+        stale metadata that was only ever refreshed while the token trended)."""
+        row = self.candidate(addr)
+        if not row:
+            return
+        cur = json.loads(row[9] or "{}") if row[9] else {}
+        cur.update(meta or {})
+        self.conn.execute(
+            "UPDATE candidates SET meta_json=? WHERE token_address=?", (json.dumps(cur), addr))
 
     # ---- evaluations ----
     def row_eval(self, addr, cfg, market_ts, decision_ts, observed_at, entry_price,

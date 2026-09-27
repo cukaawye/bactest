@@ -41,6 +41,12 @@ MIN_META_MC = 300000
 
 # ---- exit mechanics (common.py) ----
 REC = 0.05  # recovery-exit level as fraction of entry reference peak
+# ponytail: gap-aware SL fills (Vapor-only, deviates from walk()): when a bar
+# OPENS below the stop level, the stop gapped through and the real fill is at
+# the open, not the optimistic stop level. Live 1m-bar fills showed a mean
+# ~4.8pp shortfall vs the exact-stop model on meme sell-offs. False = exact
+# stop level (old behavior, matches the research replay exactly).
+GAP_FILL = True
 
 # ---- cost model (backtest.py / common.py replay) ----
 FEE = 0.025

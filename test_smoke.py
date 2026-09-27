@@ -621,6 +621,95 @@ def temp_db():
     return p
 
 
+# ---- Phase 2 correctness fixes ----
+@test
+def test_gap_fill_sl_uses_open_when_bar_gaps_below_stop():
+    db = dbmod.DB(temp_db())
+    st = engine.TokenState("gaptest", db, None)
+    st.configs = [{"id": 970, "lb": 3, "dip": 0.25, "tp": 0.5, "sl": 0.5, "hold": 0}]
+    s = mk_series(6, 1.0)
+    sig = bar(s[-1][0] + 60000, 1.0, 1.0, 0.6, 0.6)        # entry 0.6, sl 0.3
+    gapbar = bar(sig[0] + 60000, 0.2, 0.2, 0.1, 0.15)      # opens below 0.3 -> fill 0.2
+    st.ingest(s + [sig]); st.process_new_bars(time.time())
+    st.ingest([gapbar]); st.process_new_bars(time.time() + 1)
+    row = db.conn.execute(
+        "SELECT exit_reason, exit_price, gross_ret FROM paper_trades").fetchone()
+    assert row[0] == "sl" and abs(row[1] - 0.2) < 1e-9, row
+    assert abs(row[2] - (0.2 / 0.6 - 1.0)) < 1e-9, row
+
+
+@test
+def test_misses_reset_when_candidate_reappears_in_trending():
+    db = dbmod.DB(temp_db())
+    db.upsert_candidate("mr", "MR", "MR", 1.0, 10000.0, {})
+    db.bump_miss("mr"); db.bump_miss("mr")
+    assert db.candidate("mr")[10] == 2
+    db.upsert_candidate("mr", "MR", "MR", 1.0, 10000.0, {})   # re-seen in trending
+    assert db.candidate("mr")[10] == 0, db.candidate("mr")[10]
+
+
+@test
+def test_observation_revision_overwrites_first_seen_bar():
+    db = dbmod.DB(temp_db())
+    db.add_observations("rev", [(1000, 1.0, 1.0, 1.0, 1.0, 5.0)])
+    row = db.observations("rev")[0]
+    assert (row[1], row[4]) == (1.0, 1.0)
+    db.add_observations("rev", [(1000, 0.5, 0.8, 0.4, 0.6, 9.0)])
+    row = db.observations("rev")[0]
+    assert row[3] == 0.4 and row[4] == 0.6, row   # revised close/low win
+    assert len(db.observations("rev")) == 1
+
+
+@test
+def test_feed_snapshot_records_exact_fetch_inputs():
+    db = dbmod.DB(temp_db())
+    bars = [(1000, 1.0, 1.2, 0.9, 1.0, 7.0)]
+    db.feed_snapshot("fb", 123000, 1.0, bars, {"pcp1h": 5.0})
+    row = db.conn.execute("SELECT price, bars_json, meta_json FROM feed_snapshots").fetchone()
+    assert row[0] == 1.0
+    assert row[1] == json.dumps(bars), row[1]
+    assert row[2] == json.dumps({"pcp1h": 5.0}), row[2]
+
+
+@test
+def test_gate_fail_closed_when_candidate_row_missing():
+    # no candidate row at all: was previously skipped (fail open) because of the
+    # `if cand:` guard; now must block with the gate reason.
+    prev = config.MIN_PCP1H_PCT
+    try:
+        config.MIN_PCP1H_PCT = 10
+        db = dbmod.DB(temp_db())
+        s = mk_series(config.MIN_BARS_ENTER, 1.0)
+        sig = bar(int(time.time() * 1000) + 122 * 60000, 1.0, 1.0, 0.6, 0.6)
+        st = engine.TokenState("nocand", db, None, watch_start_ms=s[-1][0] + 1000)
+        st.configs = [{"id": 980, "lb": 10, "dip": 0.25, "tp": 0.5, "sl": 0.5, "hold": 0}]
+        st.ingest(s + [sig]); st.process_new_bars(time.time())
+        assert len(st.open_trade_ids) == 0, st.open_trade_ids
+        reasons = [r[0] for r in db.conn.execute("SELECT DISTINCT reason FROM evaluations")]
+        assert "cold-pcp1h" in reasons, reasons
+    finally:
+        config.MIN_PCP1H_PCT = prev
+
+
+@test
+def test_expire_defers_when_open_trade_has_no_data():
+    db = dbmod.DB(temp_db())
+    addr = "nodex"
+    db.upsert_candidate(addr, "NOX", "NoX", 1.0, 10000.0, {})
+    st = engine.TokenState(addr, db, None)
+    st.configs = [{"id": 990, "lb": 3, "dip": 0.25, "tp": 1.00, "sl": 0.5, "hold": 0}]
+    s = mk_series(6, 1.0)
+    s.append(bar(s[-1][0] + 60000, 1.0, 1.0, 0.6, 0.6))
+    st.ingest(s); st.process_new_bars(time.time())
+    assert len(st.open_trade_ids) == 1
+    st.bars = []   # simulate lost data window with an open trade
+    st.expire()
+    assert db.candidate(addr)[8] == "MONITORING", db.candidate(addr)[8]
+    assert db.conn.execute("SELECT state FROM paper_trades").fetchone()[0] == "OPEN"
+    errs = db.events_by_type("error")
+    assert any("expire deferred" in (e[5] or "") for e in errs)
+
+
 def main():
     os.environ["VAPOR_DB"] = temp_db()
     import pandas as pd, numpy as np  # noqa: F401 (parity needs them importable)
