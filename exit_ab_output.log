@@ -1,0 +1,16 @@
+vapor.db: tokens=69 bars=18624
+vapor.db.new: tokens=158 bars=82917
+Traceback (most recent call last):
+  File "C:\Users\hp\vapor\exit_ab_test.py", line 346, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\hp\vapor\exit_ab_test.py", line 298, in main
+    uni = pg.load_db_universe([path])
+  File "C:\Users\hp\vapor\parity_gmgn.py", line 187, in load_db_universe
+    for addr, sym, liq, first_seen, meta_json in conn.execute(
+                                                 ~~~~~~~~~~~~^
+            "SELECT token_address, symbol, liquidity, first_seen_at, meta_json"
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            " FROM candidates"):
+            ^^^^^^^^^^^^^^^^^^^
+sqlite3.OperationalError: no such table: candidates

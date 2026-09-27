@@ -22,7 +22,8 @@ import config
 def walk_trades(bars, cfg, watch_start_ms, fresh_bars, min_pcp1h, min_mc, meta):
     """Mirror of engine._entry_signal + _my_exit over a recorded series.
     Returns list of (entry_idx, exit_idx, gross, why). Gate-rejected signals
-    are skipped (pos advances) without a trade."""
+    are skipped (pos advances) without a trade.
+    Exit params are read from cfg (sl=-1 falls back to default)."""
     n = len(bars)
     close = [b[4] for b in bars]
     high = [b[2] for b in bars]

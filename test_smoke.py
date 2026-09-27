@@ -202,7 +202,7 @@ def test_tp_exit():
     st.configs = [{"id": 900, "lb": 3, "dip": 0.25, "tp": 0.5, "sl": 0.5, "hold": 0}]
     s = mk_series(6, 1.0)
     sig = bar(s[-1][0] + 60000, 1.0, 1.0, 0.6, 0.6)       # signal (0.6 < 0.75)
-    tpbar = bar(sig[0] + 60000, 0.6, 2.0, 0.55, 1.9)       # high >= tp(0.9)
+    tpbar = bar(sig[0] + 60000, 0.6, 0.92, 0.55, 0.91)    # high >= tp(0.9), stays under rec(0.95)
     st.ingest(s + [sig])
     base = time.time()
     st.process_new_bars(base)
@@ -228,6 +228,33 @@ def test_sl_exit_with_rec_priority_order():
     st.process_new_bars(time.time() + 1)
     row = db.conn.execute("SELECT state, exit_reason FROM paper_trades").fetchone()
     assert row[1] == "sl", row
+
+
+@test
+def test_sl_cooldown_blocks_reentry():
+    # after an SL exit, a fresh dip within the cooldown window must NOT re-enter
+    db = dbmod.DB(temp_db())
+    st = engine.TokenState("addr", db, None)
+    st.configs = [{"id": 991, "lb": 3, "dip": 0.25, "tp": 1.00, "sl": 0.5, "hold": 3}]
+    old = config.SL_COOLDOWN_MIN
+    config.SL_COOLDOWN_MIN = 60
+    try:
+        s = mk_series(6, 1.0)
+        sig = bar(s[-1][0] + 60000, 1.0, 1.0, 0.6, 0.6)       # entry 0.6, ref 1.0
+        slbar = bar(sig[0] + 60000, 0.6, 0.7, 0.25, 0.6)      # low<=sl(0.3) -> SL
+        st.ingest(s + [sig])
+        st.process_new_bars(time.time())
+        st.ingest([slbar])
+        st.process_new_bars(time.time() + 1)
+        assert db.conn.execute("SELECT exit_reason FROM paper_trades").fetchone()[0] == "sl"
+        # dip again right after the SL (still within 60min)
+        s2 = bar(slbar[0] + 60000, 0.4, 0.4, 0.38, 0.38)       # close below 0.25*ref
+        st.ingest([s2])
+        st.process_new_bars(time.time() + 2)
+        row = db.conn.execute("SELECT COUNT(*) FROM paper_trades WHERE state='OPEN'").fetchone()
+        assert row[0] == 0, f"cooldown should block re-entry, open={row[0]}"
+    finally:
+        config.SL_COOLDOWN_MIN = old
 
 
 @test
@@ -708,6 +735,70 @@ def test_expire_defers_when_open_trade_has_no_data():
     assert db.conn.execute("SELECT state FROM paper_trades").fetchone()[0] == "OPEN"
     errs = db.events_by_type("error")
     assert any("expire deferred" in (e[5] or "") for e in errs)
+
+
+@test
+def test_warmup_is_bars_ingested_so_far_not_total_series_length():
+    # Regression for the replay harness bug that produced 6 phantom trades in the
+    # 24h GMGN replay: a warmup check on len(FULL series) instead of the bars
+    # ingested SO FAR lets the engine trade on bars 0..MIN_BARS_ENTER-1 of a
+    # short-history token, which live never does (it has not seen them yet).
+    db = dbmod.DB(temp_db())
+    addr = "shortwarm"
+    db.upsert_candidate(addr, "SW", "SW", 1.0, 100000.0, {})
+    n = config.MIN_BARS_ENTER + 8
+    base = int(time.time() * 1000)
+    bars = [bar(base + i * 60000, 1.0, 1.0, 1.0, 1.0) for i in range(n)]
+    early = bar(base + (config.MIN_BARS_ENTER - 3) * 60000, 1.0, 1.0, 0.5, 0.5)  # < gate
+    bars[config.MIN_BARS_ENTER - 3] = early
+    late = bar(base + (config.MIN_BARS_ENTER + 2) * 60000, 1.0, 1.0, 0.5, 0.5)  # > gate
+    bars[config.MIN_BARS_ENTER + 2] = late
+    st = engine.TokenState(addr, db, None, watch_start_ms=base)
+    st.configs = [{"id": 995, "lb": 10, "dip": 0.25, "tp": 0.5, "sl": 0.5, "hold": 0}]
+    # feed bar-by-bar like the live loop, so len(self.bars) == i+1 at each step
+    for b in bars:
+        st.ingest([b])
+        st.process_new_bars((b[0] + 60000) / 1000.0)
+    rows = db.conn.execute(
+        "SELECT market_ts FROM evaluations WHERE triggered=1").fetchall()
+    assert [r[0] for r in rows] == [late[0]], \
+        f"must trade only on the post-warmup dip, got {[r[0] for r in rows]}"
+    early_reasons = [r[0] for r in db.conn.execute(
+        "SELECT reason FROM evaluations WHERE market_ts=?", (early[0],))]
+    assert early_reasons == ["warmup-bars"], early_reasons
+
+
+@test
+def test_incremental_ref_for_is_identical_to_full_recompute():
+    # _ref_for caches the rolling-high array across appends (O(lb) per new bar
+    # instead of O(n*lb) per call). ref[i] only looks backwards, so it must be
+    # bit-identical to strategy.ref_for on the same prefix - check on the real
+    # harvested series, for every frozen lb, at every prefix length.
+    import numpy as np
+    for addr, c, h, l, ts in _load_parity()[:6]:
+        db = dbmod.DB(temp_db())
+        st = engine.TokenState(addr, db, None)
+        bars = [bar(ts[i], c[i], h[i], l[i], c[i]) for i in range(len(c))]
+        for cfg in config.FROZEN_CONFIGS:
+            lb = cfg["lb"]
+            for cut in (1, 2, 5, len(bars) // 2, len(bars) - 1, len(bars)):
+                if cut < 1:
+                    continue
+                st.bars = bars[:cut]
+                st._ref_cache = {}          # cold path on the prefix
+                a = st._ref_for(lb)
+                st._ref_cache = {}          # build at `cut`, then extend to full
+                st.bars = bars[:cut]
+                st._ref_for(lb)
+                st.bars = bars
+                b = st._ref_for(lb)
+                # ref[i] looks only backwards, so the prefix computed on bars[:cut]
+                # must equal the first `cut` entries of the same array on all bars
+                assert len(b) == len(bars) and np.array_equal(
+                    a, b[:cut], equal_nan=True), \
+                    f"incremental ref mismatch {addr} lb={lb} cut={cut}"
+        st.bars = []
+        st._ref_cache = {}
 
 
 def main():

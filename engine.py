@@ -29,13 +29,21 @@ class TokenState:
         self.gmgn = gmgn
         self.watch_start_ms = watch_start_ms  # earliest market_ts eligible for entries
         self.bars = []          # list of (market_ts, open, high, low, close, volume)
-        self.configs = [dict(c) for c in config.FROZEN_CONFIGS]
+        # only the ACTIVE subset runs live; force the combo hold so every entry
+        # gets a time-stop even when the frozen config says hold=0.
+        self.configs = [dict(c) for c in config.FROZEN_CONFIGS
+                        if not config.ACTIVE_CONFIG_IDS or c["id"] in config.ACTIVE_CONFIG_IDS]
+        for c in self.configs:
+            if config.COMBO_HOLD_MIN:
+                c["hold"] = config.COMBO_HOLD_MIN
         self.state = "DISCOVERED"
         self.open_trade_ids = {}   # config_id -> db trade id
         self.last_exit_idx = {c["id"]: -1 for c in self.configs}
+        self.sl_cooldown_until_ms = 0.0  # no new entries for this token before this ts
         self.last_eval_idx = -2   # last bar index evaluated (setup detection passthrough)
         self.last_trigger_idx = {c["id"]: None for c in self.configs}
         self._last_raw_fetch = []   # raw bars from the last gmgn fetch (snapshot)
+        self._ref_cache = {}        # lb -> {"ref": array, "n": bars appended, "ts": last bar}
 
     # ---- data feed ----
     def ingest(self, bars):
@@ -68,8 +76,30 @@ class TokenState:
 
     # ---- strategy ----
     def _ref_for(self, lb):
-        highs = [b[2] for b in self.bars]
-        return strategy.ref_for(highs, lb)
+        """strategy.ref_for(high, lb), computed incrementally.
+
+        ref[i] = max(high[max(0, i-lb) : i]) and depends only on bars BEFORE i, so
+        appending bars extends the array by exactly the new elements - output is
+        bit-identical to recomputing from scratch, at O(lb) per new bar instead of
+        O(n*lb) per call. That matters: this runs on EVERY bar of EVERY token (it
+        is evaluated before the entry-signal early returns), so the previous
+        whole-array rebuild made each poll cycle O(n^2*lb) per token.
+        Falls back to a full rebuild if the series was replaced, not appended.
+        """
+        n = len(self.bars)
+        if n < 1:
+            return strategy.ref_for([], lb)
+        ts = self.bars[-1][0]
+        c = self._ref_cache.get(lb)
+        if c is not None and c["ts"] == ts and c["n"] <= n:
+            ref, highs = c["ref"], [b[2] for b in self.bars]
+            for k in range(max(1, c["n"]), n):
+                ref[k] = max(highs[max(0, k - lb):k])
+            c["n"], c["ts"] = n, ts
+            return ref
+        ref = strategy.ref_for([b[2] for b in self.bars], lb)
+        self._ref_cache[lb] = {"ref": ref, "n": n, "ts": ts}
+        return ref
 
     def _peak_is_stale(self, i, lb, peak):
         """True if the bar that set the rolling-high peak (within the lb window)
@@ -86,12 +116,25 @@ class TokenState:
         return True  # peak not found in window: treat as stale (defensive)
 
     def _my_exit(self, cfg, open_trade_idx, entry_price, ref_peak):
-        """Causal scan for one open trade on the CURRENT series, matching
-        walk()'s SL -> rec -> TP -> (hold "end") ordering exactly.
+        """Causal scan for one open trade on the CURRENT series.
         Returns (exit_idx, exit_price, why) or (None, None, None) if still open.
         - hold>0: at most bars i+1 .. i+hold are scanned; if none breach in the
           full hold window, trades time out at the close of bar i+hold.
         - hold=0: scan the whole current series; no timeout (stays OPEN).
+
+        TRAIL_ARM == 0 (default): legacy scan, matching walk()'s
+        SL -> rec -> TP -> (hold "end") ordering exactly - unchanged behavior.
+
+        TRAIL_ARM > 0 (Option B trailing stop, certified 3-DB replay in config.py):
+          - initial fixed stop at entry*(1 - TRAIL_INIT_SL) while not armed
+          - arm when a bar's high touches entry*(1 + TRAIL_ARM)
+          - the arm bar must COMPLETE before the trail can trigger: the running
+            peak starts at the arm bar's high and only updates from the PREVIOUS
+            bar's high afterwards, so same-bar arm+exit never happens
+          - trail stop = running_peak * (1 - TRAIL_PCT); reason "trail"
+          - rec/tp levels are bypassed while trailing is active (with dip 0.25
+            the rec level is always >= +26.7% over entry, above the arm)
+          - gap-aware fills everywhere (open below the stop fills at the open)
         """
         c = [b[4] for b in self.bars]
         o = [b[1] for b in self.bars]
@@ -99,10 +142,35 @@ class TokenState:
         l = [b[3] for b in self.bars]
         n = len(self.bars)
         i = open_trade_idx
+        we = min(n, i + 1 + cfg["hold"]) if cfg["hold"] else n
+
+        if config.TRAIL_ARM > 0:
+            init_sl = entry_price * (1 - (config.TRAIL_INIT_SL or 0.20))
+            arm = entry_price * (1 + config.TRAIL_ARM)
+            trail_pct = config.TRAIL_PCT or 0.15
+            j = i + 1
+            peak = None
+            while j < we:
+                if peak is None:
+                    if l[j] <= init_sl:
+                        px = o[j] if config.GAP_FILL and o[j] < init_sl else init_sl
+                        return j, px, "sl"
+                    if h[j] >= arm:
+                        peak = h[j]        # armed; trail may trigger from j+1 on
+                else:
+                    peak = max(peak, h[j - 1])   # peak thru the previous bar only
+                    stop = peak * (1 - trail_pct)
+                    if l[j] <= stop:
+                        px = o[j] if config.GAP_FILL and o[j] < stop else stop
+                        return j, px, "trail"
+                j += 1
+            if cfg["hold"] and we == i + 1 + cfg["hold"]:
+                return i + cfg["hold"], c[i + cfg["hold"]], "end"
+            return None, None, None
+
         sl_lvl = entry_price * (1 - cfg["sl"])
         tp_lvl = entry_price * (1 + cfg["tp"])
         rec_lvl = ref_peak * (1 - strategy.REC)
-        we = min(n, i + 1 + cfg["hold"]) if cfg["hold"] else n
         j = i + 1
         while j < we:
             if l[j] <= sl_lvl:
@@ -110,7 +178,10 @@ class TokenState:
                 # through and the real fill is at the open (worse than the stop level).
                 px = o[j] if config.GAP_FILL and o[j] < sl_lvl else sl_lvl
                 return j, px, "sl"
-            if h[j] >= rec_lvl and rec_lvl <= tp_lvl:
+            if h[j] >= rec_lvl and (config.SELL_ALL_AT_REC or rec_lvl <= tp_lvl):
+                # combo: rec is a guaranteed level, sell everything the moment it's
+                # touched (even if that means a smaller win than tp). Baseline keeps
+                # rec only while it's the cheaper exit (rec <= tp).
                 return j, rec_lvl, "rec"
             if h[j] >= tp_lvl:
                 return j, tp_lvl, "tp"
@@ -151,6 +222,11 @@ class TokenState:
         addr = trow[0]
         self.open_trade_ids.pop(cfg["id"], None)
         self.last_exit_idx[cfg["id"]] = ex
+        if why in ("sl", "trail") and config.SL_COOLDOWN_MIN:
+            # churn killer: no new entries for this token until the cooldown window
+            # has passed since the stop-loss exit. Trail stops count too: they are
+            # stop losses (only reachable while TRAIL_ARM > 0).
+            self.sl_cooldown_until_ms = self.bars[ex][0] + config.SL_COOLDOWN_MIN * 60000
         self.db.event("paper_exit", addr, cfg["id"], {
             "config_id": cfg["id"], "exit_ts": self.bars[ex][0], "exit_price": px,
             "reason": why, "gross_ret": gross, "net_ret": net,
@@ -187,6 +263,13 @@ class TokenState:
             # must NEVER trigger a paper entry (prospective method).
             self.db.row_eval(self.addr, cfg, market_ts, decision_ts, decision_ms,
                              close_i, ref_i, None, False, "pre-watch")
+            return
+        if self.sl_cooldown_until_ms and market_ts < self.sl_cooldown_until_ms:
+            # combo churn killer: token stop-lossed recently, stay out until the
+            # cooldown lapses (dips right after an SL keep bleeding; recording them
+            # as re-entries was the biggest drawdown source in the pre-gate run).
+            self.db.row_eval(self.addr, cfg, market_ts, decision_ts, decision_ms,
+                             close_i, ref_i, None, False, "sl-cooldown")
             return
         if self.open_trade_ids.get(cfg["id"]):
             self.db.row_eval(self.addr, cfg, market_ts, decision_ts, decision_ms,
